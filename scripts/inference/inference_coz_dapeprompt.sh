@@ -14,4 +14,5 @@ CUDA_VISIBLE_DEVICES=0,1, python inference_coz.py \
 --pretrained_model_name_or_path 'stabilityai/stable-diffusion-3-medium-diffusers' \
 --ram_ft_path ckpt/DAPE/DAPE.pth \
 --ram_path ckpt/RAM/ram_swin_large_14m.pth \
+--save_prompts;
 

@@ -13,6 +13,8 @@ from ram.models.ram_lora import ram
 from ram import inference_ram as inference
 from utils.wavelet_color_fix import adain_color_fix, wavelet_color_fix
 
+from peft import PeftModel
+
 tensor_transforms = transforms.Compose([
     transforms.ToTensor(),
 ])
@@ -40,7 +42,7 @@ def get_validation_prompt(args, image, prompt_image_path, dape_model=None, vlm_m
         lq_ram = ram_transforms(lq).to(dtype=weight_dtype)
         captions = inference(lq_ram, dape_model)
         prompt_text = f"{captions[0]}, {args.prompt}," if args.prompt else captions[0]
-    elif args.prompt_type in ("vlm"):
+    elif args.prompt_type in ('vlm','vlm_base'):
         message_text = None
         
         if args.rec_type == "recursive":
@@ -113,7 +115,7 @@ def get_validation_prompt(args, image, prompt_image_path, dape_model=None, vlm_m
             model.vae.to('cpu')
             vlm_model.to('cuda') # vlm_model should already be on its device_map="auto" device
 
-        generated_ids = vlm_model.generate(**inputs, max_new_tokens=128)
+        generated_ids = vlm_model.generate(**inputs, max_new_tokens=32)
         generated_ids_trimmed = [
             out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
         ]
@@ -147,20 +149,23 @@ if __name__ == "__main__":
     parser.add_argument('--align_method', type=str, choices=['wavelet', 'adain', 'nofix'], default='nofix')
     parser.add_argument('--lora_path', type=str, default=None, help='for LoRA of SR model')
     parser.add_argument('--vae_path', type=str, default=None)
+    parser.add_argument('--vlm_lora_path', type=str, default=None, help='Path to the VLM LoRA adapter directory')
     parser.add_argument('--prompt', type=str, default='', help='user prompts')
-    parser.add_argument('--prompt_type', type=str, choices=['null','dape','vlm'], default='dape', help='type of prompt to use')
+    parser.add_argument('--prompt_type', type=str, choices=['null','dape','vlm_base','vlm'], default='dape', help='type of prompt to use')
     parser.add_argument('--ram_path', type=str, default=None)
     parser.add_argument('--ram_ft_path', type=str, default=None)
-    parser.add_argument('--save_prompts', type=bool, default=True)
     parser.add_argument('--mixed_precision', type=str, choices=['fp16', 'fp32'], default='fp16')
     parser.add_argument('--merge_and_unload_lora', action='store_true', help='merge lora weights before inference')
     parser.add_argument('--lora_rank', type=int, default=4)
-    parser.add_argument('--vae_decoder_tiled_size', type=int, default=224)
-    parser.add_argument('--vae_encoder_tiled_size', type=int, default=1024)
-    parser.add_argument('--latent_tiled_size', type=int, default=96)
-    parser.add_argument('--latent_tiled_overlap', type=int, default=32)
-    parser.add_argument('--rec_type', type=str, choices=['nearest', 'bicubic','onestep','recursive','recursive_multiscale'], default='recursive', help='type of inference to use')
+    parser.add_argument('--rec_type', type=str, choices=['nearest', 'bicubic','onestep','recursive','recursive_multiscale'], default='recursive_multiscale', help='type of inference to use')
     parser.add_argument('--rec_num', type=int, default=4)
+    
+    parser.add_argument('--vae_encoder_tiled_size', type=int, default=1024)
+    parser.add_argument('--vae_decoder_tiled_size', type=int, default=128)
+    parser.add_argument('--latent_tiled_size', type=int, default=64)
+    parser.add_argument('--latent_tiled_overlap', type=int, default=16)
+    
+    parser.add_argument('--save_prompts', default=False, action='store_true')
     parser.add_argument('--efficient_memory', default=False, action='store_true')
     args = parser.parse_args()
 
@@ -215,7 +220,7 @@ if __name__ == "__main__":
     global vlm_processor
     global process_vision_info
     vlm_processor = None
-    if args.prompt_type == "vlm":
+    if args.prompt_type in ('vlm','vlm_base'):
         from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
         from qwen_vl_utils import process_vision_info
 
@@ -228,6 +233,19 @@ if __name__ == "__main__":
         )
         vlm_processor = AutoProcessor.from_pretrained(vlm_model_name)
         print('Base VLM LOADING COMPLETE')
+        
+        if args.prompt_type == "vlm":
+            if not args.vlm_lora_path:
+                raise ValueError("Please specify --vlm_lora_path when using prompt_type 'vlm'")
+            if not os.path.isdir(args.vlm_lora_path):
+                raise ValueError(f"VLM LoRA path does not exist or is not a directory: {args.vlm_lora_path}")
+
+            # load the GRPO fine-tuned VLM LoRA adapter
+            print(f"Loading VLM LoRA adapter from: {args.vlm_lora_path}")
+            vlm_model = PeftModel.from_pretrained(vlm_model, args.vlm_lora_path)
+            vlm_model = vlm_model.merge_and_unload()
+            vlm_model.eval()
+            print('VLM LoRA ADAPTER LOADING COMPLETE')
 
     os.makedirs(args.output_dir, exist_ok=True)
     os.makedirs(os.path.join(args.output_dir, 'per-sample'), exist_ok=True)

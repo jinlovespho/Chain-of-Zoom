@@ -26,7 +26,9 @@ Because visual cues diminish at high magnifications, we augment each zoom step w
 This prompt extractor can be fine-tuned through GRPO with a critic VLM to further align text guidance towards human preference.
 
 ## 🗓 ️News
-- [May 2025] Code and paper are uploaded.
+- [Aug 2025] Additional code released.
+- [Jun 2025] Check out the awesome 🤗 [Huggingface Space](https://huggingface.co/spaces/alexnasa/Chain-of-Zoom) by [@alexnasa](https://huggingface.co/alexnasa)! Thanks for the awesome work!
+- [May 2025] Code and paper released.
 
 ## 🛠️ Setup
 First, create your environment. We recommend using the following commands. 
@@ -48,7 +50,7 @@ pip install -r requirements.txt
 |Qwen2.5-VL-3B-Instruct|[Hugging Face](https://huggingface.co/Qwen/Qwen2.5-VL-3B-Instruct)
 |RAM|[Hugging Face](https://huggingface.co/spaces/xinyu1205/recognize-anything/blob/main/ram_swin_large_14m.pth)
 
-## 🌄 Example
+## ⚡ Quick Inference
 You can quickly check the results of using **CoZ** with the following example:
 ```
 python inference_coz.py \
@@ -58,17 +60,50 @@ python inference_coz.py \
   --prompt_type vlm \
   --lora_path ckpt/SR_LoRA/model_20001.pkl \
   --vae_path ckpt/SR_VAE/vae_encoder_20001.pt \
+  --vlm_lora_path ckpt/VLM_LoRA/checkpoint-10000 \
   --pretrained_model_name_or_path 'stabilityai/stable-diffusion-3-medium-diffusers' \
   --ram_ft_path ckpt/DAPE/DAPE.pth \
-  --ram_path ckpt/RAM/ram_swin_large_14m.pth;
+  --ram_path ckpt/RAM/ram_swin_large_14m.pth \
+  --save_prompts;
 ```
 Which will give a result like below:
 
 ![main figure](assets/example_result.png)
 
 ## 🔬 Efficient Memory
-Using ```--efficient_memory``` allows CoZ to run on a single GPU with 24GB VRAM, but highly increases inference time due to offloading. \
+Using ```--efficient_memory``` allows **CoZ** to run on a single GPU with 24GB VRAM, but highly increases inference time due to offloading. \
 We recommend using two GPUs.
+
+## 🌄 Full Image Super-Resolution
+Although our main focus is zooming into local areas, **CoZ** can be easily applied to super-resolution of full images. Try out the code below!
+
+```
+python inference_coz_full.py \
+  -i samples \
+  -o inference_results/coz_full \
+  --rec_type recursive_multiscale \
+  --prompt_type vlm \
+  --lora_path ckpt/SR_LoRA/model_20001.pkl \
+  --vae_path ckpt/SR_VAE/vae_encoder_20001.pt \
+  --vlm_lora_path ckpt/VLM_LoRA/checkpoint-10000 \
+  --pretrained_model_name_or_path 'stabilityai/stable-diffusion-3-medium-diffusers' \
+  --ram_ft_path ckpt/DAPE/DAPE.pth \
+  --ram_path ckpt/RAM/ram_swin_large_14m.pth;
+```
+
+## 🚆 Training the SR Backbone Model
+**Chain-of-Zoom** is model-agnostic and can be used with *any* pretrained text-aware SR model. In this repository we leverage OSEDiff trained with Stable Diffusion 3 Medium as its backbone model. This requires some additional installations:
+
+```
+pip install wandb opencv-python basicsr==1.4.2
+
+pip install --no-deps --extra-index-url https://download.pytorch.org/whl/cu121 xformers==0.0.28.post1
+```
+
+Please refer to the [OSEDiff](https://github.com/cswry/OSEDiff) repository for training configurations (ex. preparing training data). Now train the SR backbone model:
+```
+bash scripts/train/train_osediff_sd3.sh
+```
 
 ## 📝 Citation
 If you find our method useful, please cite as below or leave a star to this repository.

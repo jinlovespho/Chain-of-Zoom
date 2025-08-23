@@ -16,8 +16,11 @@ from peft import LoraConfig, get_peft_model
 from copy import deepcopy
 from tqdm import tqdm
 
-from diffusers import StableDiffusion3Pipeline, FluxPipeline
+from diffusers import StableDiffusion3Pipeline
 from lora.lora_layers import LoraInjectedLinear, LoraInjectedConv2d
+
+from utils.vaehook import VAEHook
+
 
 def inject_lora_vae(vae, lora_rank=4, init_lora_weights="gaussian", verbose=False):
     """
@@ -390,18 +393,16 @@ class OSEDiff_SD3_GEN(torch.nn.Module):
         self.model = base_model
         
         # Add lora to transformer
-        print('Adding Lora to OSEDiff_SD3_GEN')
+        print('Adding LoRA to OSEDiff_SD3_GEN')
         self.transformer_gen = copy.deepcopy(self.model.transformer)
         self.transformer_gen.to('cuda:1')
-        # self.transformer_gen = self.transformer_gen.float()
         
         self.transformer_gen.requires_grad_(False)
         self.transformer_gen.train()
         self.transformer_gen, hooks = add_mp_hook(self.transformer_gen)
         self.hooks = hooks
 
-        lora_params, _ = inject_lora(self.transformer_gen, {"AdaLayerNormZero"}, r=args.lora_rank, verbose=True)
-        # self.lora_params = lora_params
+        lora_params, _ = inject_lora(self.transformer_gen, {"AdaLayerNormZero"}, r=args.lora_rank, verbose=False)
         for name, param in self.transformer_gen.named_parameters():
             if "lora_" in name:
                 param.requires_grad = True   # LoRA up/down
@@ -409,8 +410,8 @@ class OSEDiff_SD3_GEN(torch.nn.Module):
                 param.requires_grad = False  # everything else
         
         # Insert LoRA into VAE
-        print("Adding Lora to VAE")
-        self.model.vae, self.lora_vae_modules_encoder = inject_lora_vae(self.model.vae, lora_rank=args.lora_rank, verbose=True)
+        print("Adding LoRA to VAE")
+        self.model.vae, self.lora_vae_modules_encoder = inject_lora_vae(self.model.vae, lora_rank=args.lora_rank, verbose=False)
 
     def predict_vector(self, z, t, prompt_emb, pooled_emb):
         v = self.transformer_gen(hidden_states=z,
@@ -466,7 +467,7 @@ class OSEDiff_SD3_REG(torch.nn.Module):
         self.transformer_org = self.model.transformer
         
         # Add lora to transformer
-        print('Adding Lora to OSEDiff_SD3_REG')
+        print('Adding LoRA to OSEDiff_SD3_REG')
         self.transformer_reg = copy.deepcopy(self.transformer_org)
         self.transformer_reg.to('cuda:1')
         
@@ -475,7 +476,7 @@ class OSEDiff_SD3_REG(torch.nn.Module):
         self.transformer_reg, hooks = add_mp_hook(self.transformer_reg)
         self.hooks = hooks
         
-        lora_params, _ = inject_lora(self.transformer_reg, {"AdaLayerNormZero"}, r=args.lora_rank, verbose=True)
+        lora_params, _ = inject_lora(self.transformer_reg, {"AdaLayerNormZero"}, r=args.lora_rank, verbose=False)
         for name, param in self.transformer_reg.named_parameters():
             if "lora_" in name:
                 param.requires_grad = True   # LoRA up/down
@@ -723,3 +724,190 @@ class OSEDiff_SD3_TEST_efficient(torch.nn.Module):
 
         return output_image
 
+
+class OSEDiff_SD3_TEST_TILE(torch.nn.Module):
+    def __init__(self, args, base_model):
+        super().__init__()
+        
+        self.args = args
+        self.model = base_model
+        self.lora_path = args.lora_path
+        self.vae_path = args.vae_path
+        
+        # Add lora to transformer
+        print(f'Loading LoRA to Transformer from {self.lora_path}')
+        self.model.transformer.requires_grad_(False)
+        lora_params, _ = inject_lora(self.model.transformer, {"AdaLayerNormZero"}, loras=self.lora_path, r=args.lora_rank, verbose=False)
+        for name, param in self.model.transformer.named_parameters():
+            param.requires_grad = False
+        
+        # Insert LoRA into VAE
+        print(f"Loading LoRA to VAE from {self.vae_path}")
+        self.model.vae, self.lora_vae_modules_encoder = inject_lora_vae(self.model.vae, lora_rank=args.lora_rank, verbose=False)
+        encoder_state_dict_fp16 = torch.load(self.vae_path, map_location="cpu")
+        self.model.vae.encoder.load_state_dict(encoder_state_dict_fp16)
+        
+        # save original forward (only once)
+        if not hasattr(self.model.vae.encoder, 'original_forward'):
+            setattr(self.model.vae.encoder, 'original_forward', self.model.vae.encoder.forward)
+        if not hasattr(self.model.vae.decoder, 'original_forward'):
+            setattr(self.model.vae.decoder, 'original_forward', self.model.vae.decoder.forward)
+        encoder_tile = args.vae_encoder_tiled_size
+        decoder_tile = args.vae_decoder_tiled_size
+        self.model.vae.encoder.forward = VAEHook(
+            self.model.vae.encoder,
+            tile_size=encoder_tile,
+            is_decoder=False,
+            fast_decoder=False,
+            fast_encoder=True,
+            color_fix=False,
+            to_gpu=True
+        )
+        self.model.vae.decoder.forward = VAEHook(
+            self.model.vae.decoder,
+            tile_size=decoder_tile,
+            is_decoder=True,
+            fast_decoder=True,
+            fast_encoder=False,
+            color_fix=False,
+            to_gpu=True
+        )
+
+    def predict_vector(self, z, t, prompt_emb, pooled_emb):
+        v = self.model.transformer(hidden_states=z,
+                             timestep=t,
+                             pooled_projections=pooled_emb,
+                             encoder_hidden_states=prompt_emb,
+                             return_dict=False)[0]
+        return v
+    
+    @torch.no_grad()
+    def create_full_latent(self, x_full: torch.Tensor, vlm_model, vlm_processor, full_path, next_path, prompt_type) -> torch.Tensor:
+        device = self.model.transformer.device
+        # 1) encode to full latent (via VAEHook)
+        z_full = self.model.vae.encode(x_full).latent_dist.sample() \
+                * self.model.vae.config.scaling_factor
+        z_full = z_full.to(device)
+        B, C, H, W = z_full.shape
+
+        # 2) grid size
+        tsize = self.args.latent_tiled_size
+        tover  = self.args.latent_tiled_overlap
+        stride = tsize - tover
+        rows = (H - tsize + stride - 1)//stride + 1
+        cols = (W - tsize + stride - 1)//stride + 1
+        print(f'TILE SIZE: {tsize}, TILE OVERLAP: {tover}, STRIDE: {stride}, ROWS: {rows}, COLS: {cols}')
+
+        # 3) make gaussian weight patched [B,C,tsize,tsize]
+        weights = self._make_gaussian(tsize, tsize, 1).to(z_full.device)
+
+        # 4) collect all patches
+        positions = []
+        out_tiles = []
+        timestep = self.model.scheduler.timesteps[0].expand(B).to(z_full.device)
+
+        for i in range(rows):
+            y0 = min(i*stride, H - tsize)
+            for j in range(cols):
+                x0 = min(j*stride, W - tsize)
+                positions.append((y0, x0))
+                patch = z_full[:, :, y0:y0+tsize, x0:x0+tsize]
+                
+                # decode and save patch for later usage
+                patch_path = f'{next_path[:-4]}_patch_row{i}col{j}.png'
+                patch_img = self.decode_full_latent(patch)
+                patch_pil = transforms.ToPILImage()((patch_img[0] * 0.5 + 0.5).clamp(0,1))
+                patch_pil.save(patch_path)
+                
+                # create prompt to explain patch (CoZ)
+                prompt = self.create_prompt(vlm_model, vlm_processor, full_path, patch_path, prompt_type)
+                print('PROMPT: ', prompt)
+                prompt_emb, pooled_emb = self.model.encode_prompt([prompt], batch_size=B)
+                prompt_emb = prompt_emb.to(z_full.device, dtype=torch.float32)
+                pooled_emb = pooled_emb.to(z_full.device, dtype=torch.float32)
+                
+                v = self.predict_vector(patch, timestep, prompt_emb, pooled_emb)
+                out_tiles.append(patch - v)
+
+        # 5) accumulate + normalize
+        z_out = torch.zeros_like(z_full)
+        z_norm = torch.zeros_like(z_full)
+        norm  = torch.zeros_like(z_full)
+
+        for (y0,x0), tile in zip(positions, out_tiles):
+            z_out[:, :, y0:y0+tsize, x0:x0+tsize] += tile
+            z_norm[:, :, y0:y0+tsize, x0:x0+tsize] += tile * weights
+            norm[:, :, y0:y0+tsize, x0:x0+tsize] += weights
+
+        # 6) avoid division by zero and finalize
+        eps = 1e-10
+        z_norm = z_norm / (norm + eps)
+        return z_norm, z_out
+
+    @torch.no_grad()
+    def decode_full_latent(self, z_full: torch.Tensor) -> torch.Tensor:
+        """
+        Decode the tiled full latent into an RGB image (with tiled VAE decoder).
+        """
+        z_full = z_full.to(self.model.vae.device)
+        img = self.model.vae.decode(z_full / self.model.vae.config.scaling_factor).sample
+        return img.clamp(-1,1)
+    
+    @torch.no_grad()
+    def create_prompt(self, vlm_model, vlm_processor, full_path, patch_path, prompt_type):
+        if prompt_type in ('vlm','vlm_base'):
+            from qwen_vl_utils import process_vision_info
+            
+            message_text = None
+            start_image_path = full_path
+            input_image_path = patch_path
+            
+            message_text = "The second image is a zoom-in of the first image. Based on this knowledge, what is in the second image? Give me a set of words."
+            messages = [
+                {"role": "system", "content": f"{message_text}"},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "image": start_image_path},
+                        {"type": "image", "image": input_image_path}
+                    ]
+                }
+            ]
+
+            text = vlm_processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            image_inputs, video_inputs = process_vision_info(messages)
+            inputs = vlm_processor(
+                text=[text],
+                images=image_inputs,
+                videos=video_inputs,
+                padding=True,
+                return_tensors="pt",
+            )
+            generated_ids = vlm_model.generate(**inputs, max_new_tokens=16)
+            generated_ids_trimmed = [
+                out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+            ]
+            output_text = vlm_processor.batch_decode(
+                generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+            )
+
+            prompt_text = output_text[0]
+            return prompt_text
+        else:
+            raise ValueError(f"Unknown prompt_type: {prompt_type}")
+    
+    def _make_gaussian(self, w, h, nb):
+        from numpy import pi, exp, sqrt
+        import numpy as np
+
+        latent_width = w
+        latent_height = h
+
+        var = 0.01
+        midpoint = (latent_width - 1) / 2       # -1 because index goes from 0 to latent_width - 1
+        x_probs = [exp(-(x-midpoint)*(x-midpoint)/(latent_width*latent_width)/(2*var)) / sqrt(2*pi*var) for x in range(latent_width)]
+        midpoint = latent_height / 2
+        y_probs = [exp(-(y-midpoint)*(y-midpoint)/(latent_height*latent_height)/(2*var)) / sqrt(2*pi*var) for y in range(latent_height)]
+
+        weights = np.outer(y_probs, x_probs)
+        return torch.tile(torch.tensor(weights, device=self.model.vae.device), (nb, self.model.vae.config.latent_channels, 1, 1))
